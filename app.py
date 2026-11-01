@@ -17,7 +17,11 @@ st.warning("College-project prototype only. These outputs are not a diagnosis an
 
 @st.cache_resource(show_spinner="Loading Phase 1-3 models...")
 def get_models():
-    return load_models(ROOT)
+    try:
+        checksums = st.secrets.get("model_sha256", {})
+    except FileNotFoundError:
+        checksums = {}
+    return load_models(ROOT, checksums=dict(checksums))
 
 mode = st.radio("How are these recordings grouped?", ["One child", "Multiple children"], horizontal=True)
 uploads = st.file_uploader("Upload videos/audio", type=["mp4", "mov", "mkv", "avi", "mp3", "wav", "m4a"], accept_multiple_files=True)

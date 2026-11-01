@@ -3,3 +3,4 @@ __pycache__/
 *.wav
 phase6_models/
 *.joblib
+.streamlit/secrets.toml

@@ -5,10 +5,14 @@ this project. They return features only; they do not diagnose autism.
 """
 from __future__ import annotations
 
+import hashlib
+import os
 import subprocess
 import tempfile
 from functools import lru_cache
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import cv2
 import numpy as np
@@ -22,6 +26,12 @@ from torchvision import transforms
 
 EMOTIONS = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
 BEHAVIOURS = ["arm_flapping", "head_banging", "spinning"]
+MODEL_REPOSITORY = "anweshasahoo/neuroscreen-models"
+MODEL_FILES = (
+    "emotion_controlled_finetune_best.pth",
+    "autism_face_best.pth",
+    "behavior_group_best.pth",
+)
 IMAGE_TRANSFORM = transforms.Compose([
     transforms.Resize((224, 224)), transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -44,18 +54,106 @@ def _state_dict(payload):
     return payload.get("model_state_dict", payload) if isinstance(payload, dict) else payload
 
 
-def load_models(root: str | Path, device: str = "cpu"):
-    """Load the three provided checkpoints from the project root."""
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as model_file:
+        for chunk in iter(lambda: model_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _checkpoint_path(root: Path, filename: str, checksums: dict[str, str] | None = None) -> Path:
+    """Return a local checkpoint or download it into the persistent user cache."""
+    checksums = checksums or {}
+    expected = checksums.get(filename) or checksums.get(Path(filename).stem)
+    if expected:
+        expected = str(expected).strip().lower()
+        if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
+            raise ValueError(f"The configured SHA-256 for {filename} must be exactly 64 hexadecimal characters.")
+
+    local_path = root / filename
+    if local_path.is_file():
+        if expected:
+            actual = _sha256(local_path)
+            if actual != expected:
+                raise ValueError(
+                    f"SHA-256 verification failed for local model {filename}: "
+                    f"expected {expected}, got {actual}. The local file was not loaded."
+                )
+        return local_path
+
+    cache_root = Path(os.environ.get(
+        "NEUROSCREEN_MODEL_CACHE_DIR",
+        str(Path.home() / ".cache" / "neuroscreen" / "models"),
+    )).expanduser()
+    try:
+        cache_root.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise RuntimeError(
+            f"Could not create the NeuroScreen model cache at {cache_root}. "
+            "Set NEUROSCREEN_MODEL_CACHE_DIR to a writable folder."
+        ) from error
+
+    cached_path = cache_root / filename
+    if cached_path.is_file() and (not expected or _sha256(cached_path) == expected):
+        return cached_path
+
+    url = f"https://huggingface.co/{MODEL_REPOSITORY}/resolve/main/{filename}"
+    request = Request(url, headers={"User-Agent": "NeuroScreen/1.0"})
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{filename}.", suffix=".part", dir=cache_root, delete=False
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            digest = hashlib.sha256()
+            with urlopen(request, timeout=60) as response:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    temporary_file.write(chunk)
+                    digest.update(chunk)
+
+        actual = digest.hexdigest()
+        if expected and actual != expected:
+            raise ValueError(
+                f"SHA-256 verification failed for downloaded model {filename}: "
+                f"expected {expected}, got {actual}. The file was not cached or loaded."
+            )
+        os.replace(temporary_path, cached_path)
+        return cached_path
+    except (HTTPError, URLError, TimeoutError, OSError) as error:
+        raise RuntimeError(
+            f"Could not download model checkpoint {filename} from Hugging Face. "
+            "Check that the repository is public, the filename exists, and this app has network access. "
+            f"Details: {error}"
+        ) from error
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+
+
+def load_models(
+    root: str | Path,
+    device: str = "cpu",
+    checksums: dict[str, str] | None = None,
+):
+    """Load the three checkpoints, using local files first and Hugging Face as a fallback."""
     import timm
     from torchvision import models
 
     root = Path(root); device = torch.device(device)
+    checkpoints = {filename: _checkpoint_path(root, filename, checksums) for filename in MODEL_FILES}
     p1 = timm.create_model("efficientnet_b0", pretrained=False, num_classes=7)
-    p1.load_state_dict(_state_dict(torch.load(root / "emotion_controlled_finetune_best.pth", map_location=device)))
+    p1.load_state_dict(_state_dict(torch.load(checkpoints["emotion_controlled_finetune_best.pth"], map_location=device)))
     p2 = models.resnet50(weights=None); p2.fc = nn.Linear(p2.fc.in_features, 2)
-    p2.load_state_dict(_state_dict(torch.load(root / "autism_face_best.pth", map_location=device)))
+    p2.load_state_dict(_state_dict(torch.load(checkpoints["autism_face_best.pth"], map_location=device)))
     p3 = PoseLSTM()
-    p3.load_state_dict(_state_dict(torch.load(root / "behavior_group_best.pth", map_location=device)))
+    p3.load_state_dict(_state_dict(torch.load(checkpoints["behavior_group_best.pth"], map_location=device)))
     for model in (p1, p2, p3): model.to(device).eval()
     return p1, p2, p3, device
 
